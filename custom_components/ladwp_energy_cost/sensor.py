@@ -122,7 +122,12 @@ async def async_setup_entry(
     )
 
     # Set up the coordinator (including loading historical data)
-    await coordinator.async_setup()
+    try:
+        # Load historical data but handle errors gracefully
+        await coordinator.async_setup()
+    except Exception as e:
+        _LOGGER.error("Error setting up coordinator: %s", str(e))
+        # Continue with setup even if historical data loading fails
     
     # Initial data fetch
     await coordinator.async_config_entry_first_refresh()
@@ -289,8 +294,7 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         """Set up the coordinator and load historical data."""
         # Initialize with past data from the current billing cycle
         await self._load_historical_data()
-        return await super().async_setup()
-        
+
     async def _load_historical_data(self) -> None:
         """Load historical data from entities since the beginning of the billing cycle."""
         start_time = self.last_reset
@@ -390,8 +394,12 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         # Need to sort by timestamp to ensure correct order
         timestamps = self._get_sorted_timestamps(grid_history, solar_history, load_history)
         
+        if not timestamps:
+            _LOGGER.warning("No valid timestamps found in historical data")
+            return
+            
         # Convert raw states to energy values
-        for timestamp in timestamps:
+        for i, timestamp in enumerate(timestamps):
             # Get power values at this timestamp
             grid_power = self._get_power_at_timestamp(grid_history, timestamp)
             solar_power = self._get_power_at_timestamp(solar_history, timestamp) if solar_history else None
@@ -401,15 +409,19 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                 continue
                 
             # Calculate energy based on distance to next timestamp
-            next_idx = timestamps.index(timestamp) + 1
-            if next_idx < len(timestamps):
-                next_timestamp = timestamps[next_idx]
-                duration_minutes = (next_timestamp - timestamp).total_seconds() / 60
-                watts_to_kwh = 1 / 60 / 1000  # Convert W to kWh for 1 minute
-                energy_factor = duration_minutes * watts_to_kwh
+            if i + 1 < len(timestamps):
+                next_timestamp = timestamps[i + 1]
+                # Ensure both are datetime objects
+                if isinstance(timestamp, datetime) and isinstance(next_timestamp, datetime):
+                    duration_minutes = (next_timestamp - timestamp).total_seconds() / 60
+                    watts_to_kwh = 1 / 60 / 1000  # Convert W to kWh for 1 minute
+                    energy_factor = duration_minutes * watts_to_kwh
+                else:
+                    # Default to 5 minutes for statistics data intervals
+                    energy_factor = 5 * WATTS_TO_KWH_PER_MINUTE
             else:
-                # Last entry - use default 1 minute interval
-                energy_factor = WATTS_TO_KWH_PER_MINUTE
+                # Last entry - use default 5 minute interval for statistics data
+                energy_factor = 5 * WATTS_TO_KWH_PER_MINUTE
                 
             # Determine time period for this timestamp
             period = self._get_time_period(timestamp)
@@ -480,8 +492,16 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         # Add grid timestamps
         for state in grid_history:
             if isinstance(state, dict) and "start" in state:
-                # Statistics data
-                timestamps.add(state["start"])
+                # Statistics data - ensure it's a datetime
+                if isinstance(state["start"], datetime):
+                    timestamps.add(state["start"])
+                else:
+                    # Try to convert if it's a string
+                    try:
+                        if isinstance(state["start"], str):
+                            timestamps.add(dt_util.parse_datetime(state["start"]))
+                    except (ValueError, TypeError):
+                        _LOGGER.debug("Couldn't convert timestamp: %s", state["start"])
             elif hasattr(state, "last_updated"):
                 # State data
                 timestamps.add(state.last_updated)
@@ -490,7 +510,14 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         if solar_history:
             for state in solar_history:
                 if isinstance(state, dict) and "start" in state:
-                    timestamps.add(state["start"])
+                    if isinstance(state["start"], datetime):
+                        timestamps.add(state["start"])
+                    else:
+                        try:
+                            if isinstance(state["start"], str):
+                                timestamps.add(dt_util.parse_datetime(state["start"]))
+                        except (ValueError, TypeError):
+                            _LOGGER.debug("Couldn't convert timestamp: %s", state["start"])
                 elif hasattr(state, "last_updated"):
                     timestamps.add(state.last_updated)
                     
@@ -498,10 +525,20 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         if load_history:
             for state in load_history:
                 if isinstance(state, dict) and "start" in state:
-                    timestamps.add(state["start"])
+                    if isinstance(state["start"], datetime):
+                        timestamps.add(state["start"])
+                    else:
+                        try:
+                            if isinstance(state["start"], str):
+                                timestamps.add(dt_util.parse_datetime(state["start"]))
+                        except (ValueError, TypeError):
+                            _LOGGER.debug("Couldn't convert timestamp: %s", state["start"])
                 elif hasattr(state, "last_updated"):
                     timestamps.add(state.last_updated)
                     
+        # Filter out any non-datetime values
+        timestamps = {ts for ts in timestamps if isinstance(ts, datetime)}
+        
         # Sort timestamps
         return sorted(list(timestamps))
         
@@ -514,16 +551,41 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         if isinstance(history[0], dict) and "start" in history[0]:
             # Find statistics entry with matching timestamp
             for entry in history:
-                if entry["start"] == timestamp:
+                if not isinstance(entry, dict) or "start" not in entry:
+                    continue
+                    
+                entry_timestamp = entry.get("start")
+                # Handle different timestamp formats
+                if not isinstance(entry_timestamp, datetime) and isinstance(entry_timestamp, str):
+                    try:
+                        entry_timestamp = dt_util.parse_datetime(entry_timestamp)
+                    except (ValueError, TypeError):
+                        continue
+                        
+                if entry_timestamp == timestamp:
                     if "mean" in entry and entry["mean"] is not None:
-                        return float(entry["mean"])
+                        try:
+                            return float(entry["mean"])
+                        except (ValueError, TypeError):
+                            pass
                     elif "sum" in entry and entry["sum"] is not None:
-                        return float(entry["sum"])
+                        try:
+                            return float(entry["sum"])
+                        except (ValueError, TypeError):
+                            pass
+                    elif "state" in entry and entry["state"] is not None:
+                        try:
+                            return float(entry["state"])
+                        except (ValueError, TypeError):
+                            pass
             return None
             
         # If it's state data
         for state in history:
-            if hasattr(state, "last_updated") and state.last_updated == timestamp:
+            if not hasattr(state, "last_updated"):
+                continue
+                
+            if state.last_updated == timestamp:
                 try:
                     return float(state.state)
                 except (ValueError, TypeError):
