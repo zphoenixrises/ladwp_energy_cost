@@ -29,6 +29,7 @@ from .const import (
     CONF_RATE_PLAN,
     CONF_BILLING_DAY,
     DEFAULT_NAME,
+    DEFAULT_BILLING_DAY,
     RATE_PLAN_STANDARD,
     RATE_PLAN_TIME_OF_USE,
     SUMMER_START_MONTH,
@@ -496,7 +497,7 @@ class LADWPEnergyCostSensor(SensorEntity):
             name=name,
             manufacturer="LADWP",
             model=f"Energy Cost Calculator ({rate_plan})",
-            sw_version="0.5.1",
+            sw_version="0.5.2",
             entry_type=DeviceEntryType.SERVICE,
         )
 
