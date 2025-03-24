@@ -14,11 +14,12 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfPower, CONF_NAME
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity import EntityCategory, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.device_registry import DeviceEntryType
 
 from .const import (
     DOMAIN,
@@ -110,6 +111,11 @@ async def async_setup_entry(
     zone = entry.data.get(CONF_ZONE, DEFAULT_ZONE)
     billing_period = entry.data.get(CONF_BILLING_PERIOD, DEFAULT_BILLING_PERIOD)
 
+    _LOGGER.debug(
+        "Setting up LADWP Energy Cost sensor with: name=%s, grid=%s, solar=%s, load=%s", 
+        name, grid_entity_id, solar_entity_id, load_entity_id
+    )
+
     coordinator = LADWPEnergyDataCoordinator(
         hass, name, grid_entity_id, solar_entity_id, load_entity_id, rate_plan, billing_day, zone, billing_period
     )
@@ -132,7 +138,9 @@ async def async_setup_entry(
         )
     ]
 
+    _LOGGER.debug("Adding %d sensors to Home Assistant", len(sensors))
     async_add_entities(sensors)
+    _LOGGER.debug("Sensors added to Home Assistant")
 
 
 class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
@@ -322,81 +330,94 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update the energy data."""
-        now = dt_util.now()
-        
-        # Check if we need to reset counters
-        if now >= self._get_next_reset_time():
-            self.data = self._init_energy_data()
-            self.last_reset = self._get_billing_cycle_start()
+        try:
+            now = dt_util.now()
             
-        # Get current state of entities
-        grid_power = self._get_entity_state(self.grid_entity_id)
-        solar_power = self._get_entity_state(self.solar_entity_id) if self.solar_entity_id else None
-        load_power = self._get_entity_state(self.load_entity_id) if self.load_entity_id else None
-        
-        if grid_power is None:
-            _LOGGER.error("Cannot get grid power state")
-            return self.data
-            
-        # Determine current time period
-        current_period = self._get_time_period(now)
-        current_rate = self._get_rate(now, current_period)
-        
-        # Calculate energy for this update interval (kWh)
-        grid_energy = grid_power * WATTS_TO_KWH_PER_MINUTE
-        
-        # Distribute grid energy to appropriate period
-        if grid_energy > 0:  # Delivered from grid (consumption)
-            self.data[f"{current_period}_kwh_delivered"] += grid_energy
-            self.data[ATTR_TOTAL_KWH_DELIVERED] += grid_energy
-        else:  # Received by grid (excess solar)
-            received_energy = abs(grid_energy)
-            self.data[f"{current_period}_kwh_received"] += received_energy
-            self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
-            
-        # Update net values and costs
-        for period in ["high_peak", "low_peak", "base"]:
-            delivered = self.data[f"{period}_kwh_delivered"]
-            received = self.data[f"{period}_kwh_received"]
-            net = delivered - received
-            
-            # Update net values
-            self.data[f"net_{period}_kwh"] = net
-            
-            # Calculate cost for this period
-            if net > 0:  # Net consumption
-                rate = self._get_rate(now, period)
-                self.data[f"{period}_cost"] = net * rate
-            else:  # Net production
-                # Credit for excess production at net metering rate
-                self.data[f"{period}_cost"] = net * NET_METERING_CREDIT_RATE
+            # Check if we need to reset counters
+            if now >= self._get_next_reset_time():
+                _LOGGER.info("Resetting energy data for new billing cycle")
+                self.data = self._init_energy_data()
+                self.last_reset = self._get_billing_cycle_start()
                 
-        # Update total net
-        self.data[ATTR_TOTAL_KWH_NET] = self.data[ATTR_TOTAL_KWH_DELIVERED] - self.data[ATTR_TOTAL_KWH_RECEIVED]
-        
-        # Process solar data if available
-        if solar_power is not None:
-            solar_energy = solar_power * WATTS_TO_KWH_PER_MINUTE
+            # Get current state of entities
+            grid_power = self._get_entity_state(self.grid_entity_id)
+            solar_power = self._get_entity_state(self.solar_entity_id) if self.solar_entity_id else None
+            load_power = self._get_entity_state(self.load_entity_id) if self.load_entity_id else None
             
-            # Add to period solar generation
-            self.data[f"{current_period}_kwh_generated"] += solar_energy
-            self.data[ATTR_TOTAL_KWH_GENERATED] += solar_energy
+            if grid_power is None:
+                _LOGGER.error("Cannot get grid power state for entity: %s", self.grid_entity_id)
+                return self.data
             
-            # Calculate savings from solar (at current period rate)
-            self.data[ATTR_SOLAR_COST_SAVINGS] += solar_energy * current_rate
+            _LOGGER.debug(
+                "Entity states - grid: %s, solar: %s, load: %s", 
+                grid_power, solar_power, load_power
+            )
+                
+            # Determine current time period
+            current_period = self._get_time_period(now)
+            current_rate = self._get_rate(now, current_period)
             
-        # Process load data if available
-        if load_power is not None:
-            load_energy = load_power * WATTS_TO_KWH_PER_MINUTE
+            _LOGGER.debug("Current period: %s, rate: %s", current_period, current_rate)
             
-            # Add to period consumption
-            self.data[f"{current_period}_kwh_consumed"] += load_energy
-            self.data[ATTR_TOTAL_KWH_CONSUMED] += load_energy
+            # Calculate energy for this update interval (kWh)
+            grid_energy = grid_power * WATTS_TO_KWH_PER_MINUTE
             
-            # Calculate load cost (at current period rate)
-            self.data[ATTR_LOAD_COST] += load_energy * current_rate
+            # Distribute grid energy to appropriate period
+            if grid_energy > 0:  # Delivered from grid (consumption)
+                self.data[f"{current_period}_kwh_delivered"] += grid_energy
+                self.data[ATTR_TOTAL_KWH_DELIVERED] += grid_energy
+            else:  # Received by grid (excess solar)
+                received_energy = abs(grid_energy)
+                self.data[f"{current_period}_kwh_received"] += received_energy
+                self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
+                
+            # Update net values and costs
+            for period in ["high_peak", "low_peak", "base"]:
+                delivered = self.data[f"{period}_kwh_delivered"]
+                received = self.data[f"{period}_kwh_received"]
+                net = delivered - received
+                
+                # Update net values
+                self.data[f"net_{period}_kwh"] = net
+                
+                # Calculate cost for this period
+                if net > 0:  # Net consumption
+                    rate = self._get_rate(now, period)
+                    self.data[f"{period}_cost"] = net * rate
+                else:  # Net production
+                    # Credit for excess production at net metering rate
+                    self.data[f"{period}_cost"] = net * NET_METERING_CREDIT_RATE
+                    
+            # Update total net
+            self.data[ATTR_TOTAL_KWH_NET] = self.data[ATTR_TOTAL_KWH_DELIVERED] - self.data[ATTR_TOTAL_KWH_RECEIVED]
             
-        return self.data
+            # Process solar data if available
+            if solar_power is not None:
+                solar_energy = solar_power * WATTS_TO_KWH_PER_MINUTE
+                
+                # Add to period solar generation
+                self.data[f"{current_period}_kwh_generated"] += solar_energy
+                self.data[ATTR_TOTAL_KWH_GENERATED] += solar_energy
+                
+                # Calculate savings from solar (at current period rate)
+                self.data[ATTR_SOLAR_COST_SAVINGS] += solar_energy * current_rate
+                
+            # Process load data if available
+            if load_power is not None:
+                load_energy = load_power * WATTS_TO_KWH_PER_MINUTE
+                
+                # Add to period consumption
+                self.data[f"{current_period}_kwh_consumed"] += load_energy
+                self.data[ATTR_TOTAL_KWH_CONSUMED] += load_energy
+                
+                # Calculate load cost (at current period rate)
+                self.data[ATTR_LOAD_COST] += load_energy * current_rate
+                
+            return self.data
+        except Exception as e:
+            _LOGGER.exception("Error updating LADWP energy data: %s", str(e))
+            # Return existing data on error to avoid breaking the sensor
+            return self.data
 
     def _get_entity_state(self, entity_id: Optional[str]) -> Optional[float]:
         """Get the current state of an entity as a float."""
@@ -437,6 +458,8 @@ class LADWPEnergyCostSensor(SensorEntity):
     _attr_state_class = SensorStateClass.TOTAL
     _attr_native_unit_of_measurement = "USD"
     _attr_should_poll = False
+    _attr_icon = "mdi:cash"
+    _attr_entity_category = None
 
     def __init__(
         self,
@@ -466,13 +489,14 @@ class LADWPEnergyCostSensor(SensorEntity):
         self._attr_unique_id = f"ladwp_energy_cost_{grid_entity_id.replace('.', '_')}"
         
         # Define device info
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, self._attr_unique_id)},
-            "name": name,
-            "manufacturer": "LADWP",
-            "model": f"Energy Cost ({rate_plan})",
-            "sw_version": "0.5.0",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._attr_unique_id)},
+            name=name,
+            manufacturer="LADWP",
+            model=f"Energy Cost Calculator ({rate_plan})",
+            sw_version="0.5.0",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def available(self) -> bool:
