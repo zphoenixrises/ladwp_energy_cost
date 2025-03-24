@@ -8,6 +8,11 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor"]
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the LADWP Energy Cost component from configuration.yaml."""
+    hass.data.setdefault(DOMAIN, {})
+    return True
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up LADWP Energy Cost from a config entry."""
     hass.data.setdefault(DOMAIN, {})
