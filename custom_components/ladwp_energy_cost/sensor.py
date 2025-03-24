@@ -107,13 +107,13 @@ async def async_setup_entry(
     solar_entity_id = entry.data.get(CONF_SOLAR_POWER_ENTITY)
     load_entity_id = entry.data.get(CONF_LOAD_POWER_ENTITY)
     rate_plan = entry.data.get(CONF_RATE_PLAN)
-    billing_day = entry.data.get(CONF_BILLING_DAY)
+    billing_day = int(entry.data.get(CONF_BILLING_DAY, DEFAULT_BILLING_DAY))
     zone = entry.data.get(CONF_ZONE, DEFAULT_ZONE)
     billing_period = entry.data.get(CONF_BILLING_PERIOD, DEFAULT_BILLING_PERIOD)
 
     _LOGGER.debug(
-        "Setting up LADWP Energy Cost sensor with: name=%s, grid=%s, solar=%s, load=%s", 
-        name, grid_entity_id, solar_entity_id, load_entity_id
+        "Setting up LADWP Energy Cost sensor with: name=%s, grid=%s, solar=%s, load=%s, billing_day=%s", 
+        name, grid_entity_id, solar_entity_id, load_entity_id, billing_day
     )
 
     coordinator = LADWPEnergyDataCoordinator(
@@ -170,7 +170,7 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         self.solar_entity_id = solar_entity_id
         self.load_entity_id = load_entity_id
         self.rate_plan = rate_plan
-        self.billing_day = billing_day
+        self.billing_day = int(billing_day)  # Convert to int to ensure it's an integer
         self.zone = zone
         self.billing_period = billing_period
         
@@ -228,17 +228,19 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
     def _get_billing_cycle_start(self) -> datetime:
         """Get the start of the current billing cycle."""
         now = dt_util.now()
-        if now.day >= self.billing_day:
+        billing_day = int(self.billing_day)  # Ensure billing_day is an integer
+        
+        if now.day >= billing_day:
             # Current billing cycle started this month
             return dt_util.start_of_local_day(
-                datetime(now.year, now.month, self.billing_day)
+                datetime(now.year, now.month, billing_day)
             )
         else:
             # Current billing cycle started last month
             last_month = now.month - 1 if now.month > 1 else 12
             last_month_year = now.year if now.month > 1 else now.year - 1
             return dt_util.start_of_local_day(
-                datetime(last_month_year, last_month, self.billing_day)
+                datetime(last_month_year, last_month, billing_day)
             )
 
     def _is_summer_season(self, date: datetime) -> bool:
@@ -494,7 +496,7 @@ class LADWPEnergyCostSensor(SensorEntity):
             name=name,
             manufacturer="LADWP",
             model=f"Energy Cost Calculator ({rate_plan})",
-            sw_version="0.5.0",
+            sw_version="0.5.1",
             entry_type=DeviceEntryType.SERVICE,
         )
 

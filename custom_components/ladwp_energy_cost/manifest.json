@@ -7,7 +7,7 @@
   "codeowners": ["@zphoenixrises"],
   "requirements": [],
   "iot_class": "calculated",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "config_flow": true,
   "diagnostics": true
 }
