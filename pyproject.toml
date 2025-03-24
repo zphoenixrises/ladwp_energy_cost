@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ladwp_energy_cost"
-version = "0.7.1"
+version = "0.7.2"
 description = "LADWP Energy Cost Calculator integration for Home Assistant"
 readme = "README.md"
 authors = [
