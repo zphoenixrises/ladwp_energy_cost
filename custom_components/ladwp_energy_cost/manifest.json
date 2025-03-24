@@ -2,6 +2,7 @@
   "domain": "ladwp_energy_cost",
   "name": "LADWP Energy Cost Calculator",
   "documentation": "https://github.com/zphoenixrises/ladwp_energy_cost",
+  "issue_tracker": "https://github.com/zphoenixrises/ladwp_energy_cost/issues",
   "dependencies": [],
   "codeowners": ["@zphoenixrises"],
   "requirements": [],
