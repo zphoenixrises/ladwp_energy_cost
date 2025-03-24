@@ -121,11 +121,17 @@ async def async_setup_entry(
         hass, name, grid_entity_id, solar_entity_id, load_entity_id, rate_plan, billing_day, zone, billing_period
     )
 
+    # Set up the coordinator (including loading historical data)
+    await coordinator.async_setup()
+    
     # Initial data fetch
     await coordinator.async_config_entry_first_refresh()
 
-    # Create energy cost sensor
-    sensors = [
+    # Create all sensors
+    sensors = []
+    
+    # Main cost sensor (total)
+    sensors.append(
         LADWPEnergyCostSensor(
             coordinator, 
             name, 
@@ -137,7 +143,102 @@ async def async_setup_entry(
             zone,
             billing_period
         )
-    ]
+    )
+    
+    # Add time period energy sensors
+    for period in ["high_peak", "low_peak", "base"]:
+        # Energy delivered (from grid to home)
+        sensors.append(
+            LADWPEnergyDeliveredSensor(
+                coordinator, name, grid_entity_id, period, "delivered"
+            )
+        )
+        
+        # Energy received (from home to grid)
+        sensors.append(
+            LADWPEnergyReceivedSensor(
+                coordinator, name, grid_entity_id, period, "received"
+            )
+        )
+        
+        # Net energy
+        sensors.append(
+            LADWPEnergyNetSensor(
+                coordinator, name, grid_entity_id, period, "net"
+            )
+        )
+        
+        # Period cost
+        sensors.append(
+            LADWPPeriodCostSensor(
+                coordinator, name, grid_entity_id, period, "cost"
+            )
+        )
+    
+    # Add total energy sensors
+    sensors.append(
+        LADWPTotalEnergySensor(
+            coordinator, name, grid_entity_id, "delivered"
+        )
+    )
+    
+    sensors.append(
+        LADWPTotalEnergySensor(
+            coordinator, name, grid_entity_id, "received"
+        )
+    )
+    
+    sensors.append(
+        LADWPTotalEnergySensor(
+            coordinator, name, grid_entity_id, "net"
+        )
+    )
+    
+    # Add solar sensors if solar entity is provided
+    if solar_entity_id:
+        for period in ["high_peak", "low_peak", "base"]:
+            sensors.append(
+                LADWPSolarGenerationSensor(
+                    coordinator, name, solar_entity_id, period
+                )
+            )
+        
+        # Total solar generation
+        sensors.append(
+            LADWPTotalSolarGenerationSensor(
+                coordinator, name, solar_entity_id
+            )
+        )
+        
+        # Solar cost savings
+        sensors.append(
+            LADWPSolarSavingsSensor(
+                coordinator, name, solar_entity_id
+            )
+        )
+    
+    # Add load sensors if load entity is provided
+    if load_entity_id:
+        for period in ["high_peak", "low_peak", "base"]:
+            sensors.append(
+                LADWPLoadConsumptionSensor(
+                    coordinator, name, load_entity_id, period
+                )
+            )
+        
+        # Total load consumption
+        sensors.append(
+            LADWPTotalLoadConsumptionSensor(
+                coordinator, name, load_entity_id
+            )
+        )
+        
+        # Load cost
+        sensors.append(
+            LADWPLoadCostSensor(
+                coordinator, name, load_entity_id
+            )
+        )
 
     _LOGGER.debug("Adding %d sensors to Home Assistant", len(sensors))
     async_add_entities(sensors)
@@ -175,14 +276,259 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         self.zone = zone
         self.billing_period = billing_period
         
+        # Calculate the start of the current billing cycle
+        self.last_reset = self._get_billing_cycle_start()
+        
         # Initialize energy data
         self.data = self._init_energy_data()
         
-        # Last reset time (billing cycle start)
-        self.last_reset = self._get_billing_cycle_start()
-        
         # Track when we need to reset counters
         self._unsub_tracking = None
+
+    async def async_setup(self) -> None:
+        """Set up the coordinator and load historical data."""
+        # Initialize with past data from the current billing cycle
+        await self._load_historical_data()
+        return await super().async_setup()
+        
+    async def _load_historical_data(self) -> None:
+        """Load historical data from entities since the beginning of the billing cycle."""
+        start_time = self.last_reset
+        end_time = dt_util.now()
+        
+        _LOGGER.debug("Loading historical data from %s to %s", start_time, end_time)
+        
+        # Get historical data for grid power
+        if not self.grid_entity_id:
+            _LOGGER.error("Cannot load historical data: grid_entity_id is not set")
+            return
+            
+        try:
+            # Get history from start of billing cycle
+            grid_history = await self._get_entity_history(self.grid_entity_id, start_time, end_time)
+            solar_history = None
+            load_history = None
+            
+            if self.solar_entity_id:
+                solar_history = await self._get_entity_history(self.solar_entity_id, start_time, end_time)
+                
+            if self.load_entity_id:
+                load_history = await self._get_entity_history(self.load_entity_id, start_time, end_time)
+            
+            if not grid_history:
+                _LOGGER.warning("No historical data found for grid entity: %s", self.grid_entity_id)
+                return
+                
+            # Process historical data
+            await self._process_historical_data(grid_history, solar_history, load_history)
+            
+            _LOGGER.info("Historical data loaded successfully for the current billing cycle")
+            
+        except Exception as e:
+            _LOGGER.exception("Error loading historical data: %s", str(e))
+            
+    async def _get_entity_history(self, entity_id: str, start_time: datetime, end_time: datetime) -> List[dict]:
+        """Get historical states for an entity."""
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.statistics import statistics_during_period
+        from homeassistant.components.recorder.models import StatisticMetaData
+        import homeassistant.util.dt as dt_util
+        
+        # First try to get high-resolution statistics if available (5min intervals)
+        # This is the most accurate but might not be available for all entities
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period, 
+                self.hass, 
+                start_time,
+                end_time, 
+                [entity_id], 
+                "5minute", 
+                None,
+                {"sum", "mean"}
+            )
+            
+            if stats and entity_id in stats and stats[entity_id]:
+                _LOGGER.debug("Found %d statistical data points for %s", len(stats[entity_id]), entity_id)
+                return stats[entity_id]
+        except Exception as e:
+            _LOGGER.debug("Could not get statistics for %s: %s", entity_id, str(e))
+        
+        # Fall back to getting raw history
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.history import get_significant_states
+        
+        # Get historical states
+        _LOGGER.debug("Falling back to raw history for %s", entity_id)
+        history = await get_instance(self.hass).async_add_executor_job(
+            get_significant_states,
+            self.hass,
+            start_time,
+            end_time, 
+            [entity_id],
+            None,
+            True
+        )
+        
+        if entity_id not in history:
+            _LOGGER.warning("No history found for entity %s", entity_id)
+            return []
+            
+        _LOGGER.debug("Found %d historical states for %s", len(history[entity_id]), entity_id)
+        return history[entity_id]
+        
+    async def _process_historical_data(
+        self, 
+        grid_history: List[dict], 
+        solar_history: Optional[List[dict]] = None, 
+        load_history: Optional[List[dict]] = None
+    ) -> None:
+        """Process historical data and update energy calculations."""
+        _LOGGER.debug("Processing %d historical entries for grid power", len(grid_history))
+        
+        # Process each time slice in sequence to properly track tier changes
+        # Need to sort by timestamp to ensure correct order
+        timestamps = self._get_sorted_timestamps(grid_history, solar_history, load_history)
+        
+        # Convert raw states to energy values
+        for timestamp in timestamps:
+            # Get power values at this timestamp
+            grid_power = self._get_power_at_timestamp(grid_history, timestamp)
+            solar_power = self._get_power_at_timestamp(solar_history, timestamp) if solar_history else None
+            load_power = self._get_power_at_timestamp(load_history, timestamp) if load_history else None
+            
+            if grid_power is None:
+                continue
+                
+            # Calculate energy based on distance to next timestamp
+            next_idx = timestamps.index(timestamp) + 1
+            if next_idx < len(timestamps):
+                next_timestamp = timestamps[next_idx]
+                duration_minutes = (next_timestamp - timestamp).total_seconds() / 60
+                watts_to_kwh = 1 / 60 / 1000  # Convert W to kWh for 1 minute
+                energy_factor = duration_minutes * watts_to_kwh
+            else:
+                # Last entry - use default 1 minute interval
+                energy_factor = WATTS_TO_KWH_PER_MINUTE
+                
+            # Determine time period for this timestamp
+            period = self._get_time_period(timestamp)
+            rate = self._get_rate(timestamp, period)
+            
+            # Update energy data
+            # Grid energy
+            grid_energy = grid_power * energy_factor
+            if grid_energy > 0:  # Delivered from grid (consumption)
+                self.data[f"{period}_kwh_delivered"] += grid_energy
+                self.data[ATTR_TOTAL_KWH_DELIVERED] += grid_energy
+            else:  # Received by grid (excess solar)
+                received_energy = abs(grid_energy)
+                self.data[f"{period}_kwh_received"] += received_energy
+                self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
+                
+            # Solar energy
+            if solar_power is not None:
+                solar_energy = solar_power * energy_factor
+                self.data[f"{period}_kwh_generated"] += solar_energy
+                self.data[ATTR_TOTAL_KWH_GENERATED] += solar_energy
+                self.data[ATTR_SOLAR_COST_SAVINGS] += solar_energy * rate
+                
+            # Load energy
+            if load_power is not None:
+                load_energy = load_power * energy_factor
+                self.data[f"{period}_kwh_consumed"] += load_energy
+                self.data[ATTR_TOTAL_KWH_CONSUMED] += load_energy
+                self.data[ATTR_LOAD_COST] += load_energy * rate
+                
+        # Calculate net values and costs
+        self._update_net_values_and_costs(dt_util.now())
+        
+        _LOGGER.debug("Historical processing complete. Total delivered: %.2f kWh, Total received: %.2f kWh", 
+                    self.data[ATTR_TOTAL_KWH_DELIVERED], self.data[ATTR_TOTAL_KWH_RECEIVED])
+    
+    def _update_net_values_and_costs(self, now: datetime) -> None:
+        """Update net values and costs based on current data."""
+        # Update net values and costs
+        for period in ["high_peak", "low_peak", "base"]:
+            delivered = self.data[f"{period}_kwh_delivered"]
+            received = self.data[f"{period}_kwh_received"]
+            net = delivered - received
+            
+            # Update net values
+            self.data[f"net_{period}_kwh"] = net
+            
+            # Calculate cost for this period
+            if net > 0:  # Net consumption
+                rate = self._get_rate(now, period)
+                self.data[f"{period}_cost"] = net * rate
+            else:  # Net production
+                # Credit for excess production at net metering rate
+                self.data[f"{period}_cost"] = net * NET_METERING_CREDIT_RATE
+                
+        # Update total net
+        self.data[ATTR_TOTAL_KWH_NET] = self.data[ATTR_TOTAL_KWH_DELIVERED] - self.data[ATTR_TOTAL_KWH_RECEIVED]
+    
+    def _get_sorted_timestamps(
+        self, 
+        grid_history: List[dict], 
+        solar_history: Optional[List[dict]], 
+        load_history: Optional[List[dict]]
+    ) -> List[datetime]:
+        """Get a sorted list of all timestamps from the historical data."""
+        timestamps = set()
+        
+        # Add grid timestamps
+        for state in grid_history:
+            if isinstance(state, dict) and "start" in state:
+                # Statistics data
+                timestamps.add(state["start"])
+            elif hasattr(state, "last_updated"):
+                # State data
+                timestamps.add(state.last_updated)
+                
+        # Add solar timestamps
+        if solar_history:
+            for state in solar_history:
+                if isinstance(state, dict) and "start" in state:
+                    timestamps.add(state["start"])
+                elif hasattr(state, "last_updated"):
+                    timestamps.add(state.last_updated)
+                    
+        # Add load timestamps
+        if load_history:
+            for state in load_history:
+                if isinstance(state, dict) and "start" in state:
+                    timestamps.add(state["start"])
+                elif hasattr(state, "last_updated"):
+                    timestamps.add(state.last_updated)
+                    
+        # Sort timestamps
+        return sorted(list(timestamps))
+        
+    def _get_power_at_timestamp(self, history: Optional[List[dict]], timestamp: datetime) -> Optional[float]:
+        """Get the power value at a specific timestamp from history."""
+        if not history:
+            return None
+            
+        # Check if it's statistics data
+        if isinstance(history[0], dict) and "start" in history[0]:
+            # Find statistics entry with matching timestamp
+            for entry in history:
+                if entry["start"] == timestamp:
+                    if "mean" in entry and entry["mean"] is not None:
+                        return float(entry["mean"])
+                    elif "sum" in entry and entry["sum"] is not None:
+                        return float(entry["sum"])
+            return None
+            
+        # If it's state data
+        for state in history:
+            if hasattr(state, "last_updated") and state.last_updated == timestamp:
+                try:
+                    return float(state.state)
+                except (ValueError, TypeError):
+                    return None
+        return None
 
     def _init_energy_data(self) -> Dict[str, Any]:
         """Initialize energy data structure."""
@@ -374,26 +720,6 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                 self.data[f"{current_period}_kwh_received"] += received_energy
                 self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
                 
-            # Update net values and costs
-            for period in ["high_peak", "low_peak", "base"]:
-                delivered = self.data[f"{period}_kwh_delivered"]
-                received = self.data[f"{period}_kwh_received"]
-                net = delivered - received
-                
-                # Update net values
-                self.data[f"net_{period}_kwh"] = net
-                
-                # Calculate cost for this period
-                if net > 0:  # Net consumption
-                    rate = self._get_rate(now, period)
-                    self.data[f"{period}_cost"] = net * rate
-                else:  # Net production
-                    # Credit for excess production at net metering rate
-                    self.data[f"{period}_cost"] = net * NET_METERING_CREDIT_RATE
-                    
-            # Update total net
-            self.data[ATTR_TOTAL_KWH_NET] = self.data[ATTR_TOTAL_KWH_DELIVERED] - self.data[ATTR_TOTAL_KWH_RECEIVED]
-            
             # Process solar data if available
             if solar_power is not None:
                 solar_energy = solar_power * WATTS_TO_KWH_PER_MINUTE
@@ -415,6 +741,9 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                 
                 # Calculate load cost (at current period rate)
                 self.data[ATTR_LOAD_COST] += load_energy * current_rate
+            
+            # Update net values and costs
+            self._update_net_values_and_costs(now)
                 
             return self.data
         except Exception as e:
@@ -454,15 +783,73 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
             )
 
 
-class LADWPEnergyCostSensor(SensorEntity):
+# Base sensor class with shared properties
+class LADWPBaseSensor(SensorEntity):
+    """Base class for LADWP Energy Cost sensors."""
+    
+    _attr_should_poll = False
+    
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self.coordinator = coordinator
+        self._name = name
+        self._entity_id = entity_id
+        
+        # Will be set by child classes
+        self._attr_name = None
+        self._attr_unique_id = None
+        self._attr_native_unit_of_measurement = None
+        self._attr_device_class = None
+        self._attr_state_class = None
+        self._attr_icon = None
+        
+        # Use the same device info for all sensors
+        device_id = f"ladwp_energy_cost_{entity_id.replace('.', '_')}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_id)},
+            name=name,
+            manufacturer="LADWP",
+            model="Energy Cost Calculator",
+            sw_version="0.7.0",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return self.coordinator.last_update_success
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the base state attributes of the sensor."""
+        return {
+            "last_reset": self.coordinator.last_reset,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """When entity is added to Home Assistant."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self.async_write_ha_state)
+        )
+
+    async def async_update(self) -> None:
+        """Update the entity."""
+        await self.coordinator.async_request_refresh()
+
+
+class LADWPEnergyCostSensor(LADWPBaseSensor):
     """LADWP Energy Cost Sensor."""
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
     _attr_native_unit_of_measurement = "USD"
-    _attr_should_poll = False
     _attr_icon = "mdi:cash"
-    _attr_entity_category = None
 
     def __init__(
         self,
@@ -477,9 +864,7 @@ class LADWPEnergyCostSensor(SensorEntity):
         billing_period: str = DEFAULT_BILLING_PERIOD,
     ) -> None:
         """Initialize the sensor."""
-        self.coordinator = coordinator
-        self._name = name
-        self._grid_entity_id = grid_entity_id
+        super().__init__(coordinator, name, grid_entity_id)
         self._solar_entity_id = solar_entity_id
         self._load_entity_id = load_entity_id
         self._rate_plan = rate_plan
@@ -488,23 +873,8 @@ class LADWPEnergyCostSensor(SensorEntity):
         self._billing_period = billing_period
         
         # Entity attributes
-        self._attr_name = name
+        self._attr_name = f"{name} Total Cost"
         self._attr_unique_id = f"ladwp_energy_cost_{grid_entity_id.replace('.', '_')}"
-        
-        # Define device info
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, self._attr_unique_id)},
-            name=name,
-            manufacturer="LADWP",
-            model=f"Energy Cost Calculator ({rate_plan})",
-            sw_version="0.5.2",
-            entry_type=DeviceEntryType.SERVICE,
-        )
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return self.coordinator.last_update_success
 
     @property
     def native_value(self) -> float:
@@ -526,18 +896,332 @@ class LADWPEnergyCostSensor(SensorEntity):
             "last_reset": self.coordinator.last_reset,
         }
         
-        # Add all data from coordinator
-        attrs.update(self.coordinator.data)
-        
         return attrs
 
-    async def async_added_to_hass(self) -> None:
-        """When entity is added to Home Assistant."""
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
 
-    async def async_update(self) -> None:
-        """Update the entity."""
-        await self.coordinator.async_request_refresh()
+class LADWPEnergyDeliveredSensor(LADWPBaseSensor):
+    """LADWP Energy Delivered Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:transmission-tower-export"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+        metric: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        self._metric = metric
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Energy Delivered"
+        self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the energy delivered in this period."""
+        return round(self.coordinator.data.get(f"{self._period}_kwh_delivered", 0), 3)
+
+
+class LADWPEnergyReceivedSensor(LADWPBaseSensor):
+    """LADWP Energy Received Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:transmission-tower-import"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+        metric: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        self._metric = metric
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Energy Received"
+        self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the energy received in this period."""
+        return round(self.coordinator.data.get(f"{self._period}_kwh_received", 0), 3)
+
+
+class LADWPEnergyNetSensor(LADWPBaseSensor):
+    """LADWP Energy Net Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:power-plug"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+        metric: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        self._metric = metric
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Net Energy"
+        self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the net energy in this period."""
+        return round(self.coordinator.data.get(f"net_{self._period}_kwh", 0), 3)
+
+
+class LADWPPeriodCostSensor(LADWPBaseSensor):
+    """LADWP Period Cost Sensor."""
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = "USD"
+    _attr_icon = "mdi:cash"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+        metric: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        self._metric = metric
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Cost"
+        self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the cost for this period."""
+        return round(self.coordinator.data.get(f"{self._period}_cost", 0), 2)
+
+
+class LADWPTotalEnergySensor(LADWPBaseSensor):
+    """LADWP Total Energy Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        metric: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._metric = metric
+        
+        if metric == "delivered":
+            self._attr_name = f"{name} Total Energy Delivered"
+            self._attr_unique_id = f"ladwp_total_delivered_{entity_id.replace('.', '_')}"
+            self._attr_icon = "mdi:transmission-tower-export"
+        elif metric == "received":
+            self._attr_name = f"{name} Total Energy Received"
+            self._attr_unique_id = f"ladwp_total_received_{entity_id.replace('.', '_')}"
+            self._attr_icon = "mdi:transmission-tower-import"
+        else:
+            self._attr_name = f"{name} Total Net Energy"
+            self._attr_unique_id = f"ladwp_total_net_{entity_id.replace('.', '_')}"
+            self._attr_icon = "mdi:power-plug"
+
+    @property
+    def native_value(self) -> float:
+        """Return the total energy value."""
+        if self._metric == "delivered":
+            return round(self.coordinator.data.get(ATTR_TOTAL_KWH_DELIVERED, 0), 3)
+        elif self._metric == "received":
+            return round(self.coordinator.data.get(ATTR_TOTAL_KWH_RECEIVED, 0), 3)
+        else:
+            return round(self.coordinator.data.get(ATTR_TOTAL_KWH_NET, 0), 3)
+
+
+class LADWPSolarGenerationSensor(LADWPBaseSensor):
+    """LADWP Solar Generation Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:solar-power"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Solar Generation"
+        self._attr_unique_id = f"ladwp_{period}_solar_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the solar generation for this period."""
+        return round(self.coordinator.data.get(f"{self._period}_kwh_generated", 0), 3)
+
+
+class LADWPTotalSolarGenerationSensor(LADWPBaseSensor):
+    """LADWP Total Solar Generation Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:solar-power"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        
+        self._attr_name = f"{name} Total Solar Generation"
+        self._attr_unique_id = f"ladwp_total_solar_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the total solar generation."""
+        return round(self.coordinator.data.get(ATTR_TOTAL_KWH_GENERATED, 0), 3)
+
+
+class LADWPSolarSavingsSensor(LADWPBaseSensor):
+    """LADWP Solar Savings Sensor."""
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = "USD"
+    _attr_icon = "mdi:cash-plus"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        
+        self._attr_name = f"{name} Solar Savings"
+        self._attr_unique_id = f"ladwp_solar_savings_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the total solar cost savings."""
+        return round(self.coordinator.data.get(ATTR_SOLAR_COST_SAVINGS, 0), 2)
+
+
+class LADWPLoadConsumptionSensor(LADWPBaseSensor):
+    """LADWP Load Consumption Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:home-lightning-bolt"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+        period: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        self._period = period
+        
+        period_name = period.replace("_", " ").title()
+        self._attr_name = f"{name} {period_name} Load Consumption"
+        self._attr_unique_id = f"ladwp_{period}_load_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the load consumption for this period."""
+        return round(self.coordinator.data.get(f"{self._period}_kwh_consumed", 0), 3)
+
+
+class LADWPTotalLoadConsumptionSensor(LADWPBaseSensor):
+    """LADWP Total Load Consumption Sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:home-lightning-bolt"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        
+        self._attr_name = f"{name} Total Load Consumption"
+        self._attr_unique_id = f"ladwp_total_load_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the total load consumption."""
+        return round(self.coordinator.data.get(ATTR_TOTAL_KWH_CONSUMED, 0), 3)
+
+
+class LADWPLoadCostSensor(LADWPBaseSensor):
+    """LADWP Load Cost Sensor."""
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = "USD"
+    _attr_icon = "mdi:cash-minus"
+
+    def __init__(
+        self,
+        coordinator: LADWPEnergyDataCoordinator,
+        name: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, name, entity_id)
+        
+        self._attr_name = f"{name} Load Cost"
+        self._attr_unique_id = f"ladwp_load_cost_{entity_id.replace('.', '_')}"
+
+    @property
+    def native_value(self) -> float:
+        """Return the total load cost."""
+        return round(self.coordinator.data.get(ATTR_LOAD_COST, 0), 2)
