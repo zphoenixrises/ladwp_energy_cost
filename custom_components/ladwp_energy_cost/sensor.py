@@ -436,7 +436,6 @@ class LADWPEnergyCostSensor(SensorEntity):
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
     _attr_native_unit_of_measurement = "USD"
-    _attr_has_entity_name = True
     _attr_should_poll = False
 
     def __init__(
@@ -463,8 +462,17 @@ class LADWPEnergyCostSensor(SensorEntity):
         self._billing_period = billing_period
         
         # Entity attributes
-        self._attr_name = f"{name} Cost"
-        self._attr_unique_id = f"{DOMAIN}_{grid_entity_id}_cost"
+        self._attr_name = name
+        self._attr_unique_id = f"ladwp_energy_cost_{grid_entity_id.replace('.', '_')}"
+        
+        # Define device info
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, self._attr_unique_id)},
+            "name": name,
+            "manufacturer": "LADWP",
+            "model": f"Energy Cost ({rate_plan})",
+            "sw_version": "0.5.0",
+        }
 
     @property
     def available(self) -> bool:
