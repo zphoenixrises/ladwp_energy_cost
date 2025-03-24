@@ -877,7 +877,7 @@ class LADWPBaseSensor(SensorEntity):
             name=name,
             manufacturer="LADWP",
             model="Energy Cost Calculator",
-            sw_version="0.7.0",
+            sw_version="0.7.1",
             entry_type=DeviceEntryType.SERVICE,
         )
 
@@ -956,8 +956,13 @@ class LADWPEnergyCostSensor(LADWPBaseSensor):
             "zone": self._zone,
             "billing_period": self._billing_period,
             "last_reset": self.coordinator.last_reset,
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
         }
         
+        if self._attr_device_class:
+            attrs["device_class"] = self._attr_device_class
+            
         return attrs
 
 
@@ -985,11 +990,27 @@ class LADWPEnergyDeliveredSensor(LADWPBaseSensor):
         period_name = period.replace("_", " ").title()
         self._attr_name = f"{name} {period_name} Energy Delivered"
         self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the energy delivered in this period."""
         return round(self.coordinator.data.get(f"{self._period}_kwh_delivered", 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPEnergyReceivedSensor(LADWPBaseSensor):
@@ -1016,11 +1037,27 @@ class LADWPEnergyReceivedSensor(LADWPBaseSensor):
         period_name = period.replace("_", " ").title()
         self._attr_name = f"{name} {period_name} Energy Received"
         self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the energy received in this period."""
         return round(self.coordinator.data.get(f"{self._period}_kwh_received", 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPEnergyNetSensor(LADWPBaseSensor):
@@ -1047,11 +1084,28 @@ class LADWPEnergyNetSensor(LADWPBaseSensor):
         period_name = period.replace("_", " ").title()
         self._attr_name = f"{name} {period_name} Net Energy"
         self._attr_unique_id = f"ladwp_{period}_{metric}_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the net energy in this period."""
         return round(self.coordinator.data.get(f"net_{self._period}_kwh", 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPPeriodCostSensor(LADWPBaseSensor):
@@ -1083,6 +1137,18 @@ class LADWPPeriodCostSensor(LADWPBaseSensor):
     def native_value(self) -> float:
         """Return the cost for this period."""
         return round(self.coordinator.data.get(f"{self._period}_cost", 0), 2)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPTotalEnergySensor(LADWPBaseSensor):
@@ -1115,6 +1181,13 @@ class LADWPTotalEnergySensor(LADWPBaseSensor):
             self._attr_name = f"{name} Total Net Energy"
             self._attr_unique_id = f"ladwp_total_net_{entity_id.replace('.', '_')}"
             self._attr_icon = "mdi:power-plug"
+            # Net energy should use TOTAL state class
+            self._attr_state_class = SensorStateClass.TOTAL
+            
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
@@ -1125,6 +1198,18 @@ class LADWPTotalEnergySensor(LADWPBaseSensor):
             return round(self.coordinator.data.get(ATTR_TOTAL_KWH_RECEIVED, 0), 3)
         else:
             return round(self.coordinator.data.get(ATTR_TOTAL_KWH_NET, 0), 3)
+            
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPSolarGenerationSensor(LADWPBaseSensor):
@@ -1149,11 +1234,28 @@ class LADWPSolarGenerationSensor(LADWPBaseSensor):
         period_name = period.replace("_", " ").title()
         self._attr_name = f"{name} {period_name} Solar Generation"
         self._attr_unique_id = f"ladwp_{period}_solar_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the solar generation for this period."""
         return round(self.coordinator.data.get(f"{self._period}_kwh_generated", 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPTotalSolarGenerationSensor(LADWPBaseSensor):
@@ -1175,11 +1277,28 @@ class LADWPTotalSolarGenerationSensor(LADWPBaseSensor):
         
         self._attr_name = f"{name} Total Solar Generation"
         self._attr_unique_id = f"ladwp_total_solar_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the total solar generation."""
         return round(self.coordinator.data.get(ATTR_TOTAL_KWH_GENERATED, 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPSolarSavingsSensor(LADWPBaseSensor):
@@ -1203,9 +1322,26 @@ class LADWPSolarSavingsSensor(LADWPBaseSensor):
         self._attr_unique_id = f"ladwp_solar_savings_{entity_id.replace('.', '_')}"
 
     @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
+
+    @property
     def native_value(self) -> float:
         """Return the total solar cost savings."""
         return round(self.coordinator.data.get(ATTR_SOLAR_COST_SAVINGS, 0), 2)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPLoadConsumptionSensor(LADWPBaseSensor):
@@ -1230,11 +1366,28 @@ class LADWPLoadConsumptionSensor(LADWPBaseSensor):
         period_name = period.replace("_", " ").title()
         self._attr_name = f"{name} {period_name} Load Consumption"
         self._attr_unique_id = f"ladwp_{period}_load_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the load consumption for this period."""
         return round(self.coordinator.data.get(f"{self._period}_kwh_consumed", 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPTotalLoadConsumptionSensor(LADWPBaseSensor):
@@ -1256,11 +1409,28 @@ class LADWPTotalLoadConsumptionSensor(LADWPBaseSensor):
         
         self._attr_name = f"{name} Total Load Consumption"
         self._attr_unique_id = f"ladwp_total_load_{entity_id.replace('.', '_')}"
+        
+    @property
+    def last_reset(self) -> datetime:
+        """Return the time when the sensor was last reset."""
+        return self.coordinator.last_reset
 
     @property
     def native_value(self) -> float:
         """Return the total load consumption."""
         return round(self.coordinator.data.get(ATTR_TOTAL_KWH_CONSUMED, 0), 3)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
 
 
 class LADWPLoadCostSensor(LADWPBaseSensor):
@@ -1287,3 +1457,15 @@ class LADWPLoadCostSensor(LADWPBaseSensor):
     def native_value(self) -> float:
         """Return the total load cost."""
         return round(self.coordinator.data.get(ATTR_LOAD_COST, 0), 2)
+        
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return the state attributes of the sensor."""
+        attrs = super().extra_state_attributes
+        # Add explicit attributes for energy dashboard
+        attrs.update({
+            "state_class": self._attr_state_class,
+            "unit_of_measurement": self._attr_native_unit_of_measurement,
+            "device_class": self._attr_device_class,
+        })
+        return attrs
