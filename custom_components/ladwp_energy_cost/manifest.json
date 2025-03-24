@@ -1,0 +1,11 @@
+{
+  "domain": "ladwp_energy_cost",
+  "name": "LADWP Energy Cost Calculator",
+  "documentation": "https://github.com/zphoenixrises/ladwp_energy_cost",
+  "dependencies": [],
+  "codeowners": ["@zphoenixrises"],
+  "requirements": [],
+  "iot_class": "calculated",
+  "version": "0.4.0",
+  "config_flow": true
+}
