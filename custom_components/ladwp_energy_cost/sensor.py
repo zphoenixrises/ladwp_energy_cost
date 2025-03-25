@@ -542,10 +542,37 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         # Sort timestamps
         return sorted(list(timestamps))
         
+    def _is_spike(self, power_value: float, last_valid_power: Optional[float] = None) -> bool:
+        """Detect if a power value is a spike.
+        
+        Args:
+            power_value: The power value to check
+            last_valid_power: The last valid power value for additional context
+            
+        Returns:
+            bool: True if the value is considered a spike
+        """
+        # Basic threshold check for extreme values
+        if abs(power_value) > 10000:
+            return True
+            
+        # If we have a last valid power value, check for sudden large changes
+        if last_valid_power is not None:
+            # Consider it a spike if the value changes by more than 90%
+            if abs(power_value) > 0 and abs(last_valid_power) > 0:
+                change_ratio = abs(power_value / last_valid_power)
+                if change_ratio > 10 or change_ratio < 0.1:  # 90% increase or decrease
+                    return True
+                    
+        return False
+        
     def _get_power_at_timestamp(self, history: Optional[List[dict]], timestamp: datetime) -> Optional[float]:
         """Get the power value at a specific timestamp from history."""
         if not history:
             return None
+            
+        # Track the last valid (non-spike) power value
+        last_valid_power = None
             
         # Check if it's statistics data
         if isinstance(history[0], dict) and "start" in history[0]:
@@ -563,21 +590,33 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                         continue
                         
                 if entry_timestamp == timestamp:
+                    power_value = None
                     if "mean" in entry and entry["mean"] is not None:
                         try:
-                            return float(entry["mean"])
+                            power_value = float(entry["mean"])
                         except (ValueError, TypeError):
                             pass
                     elif "sum" in entry and entry["sum"] is not None:
                         try:
-                            return float(entry["sum"])
+                            power_value = float(entry["sum"])
                         except (ValueError, TypeError):
                             pass
                     elif "state" in entry and entry["state"] is not None:
                         try:
-                            return float(entry["state"])
+                            power_value = float(entry["state"])
                         except (ValueError, TypeError):
                             pass
+                            
+                    if power_value is not None:
+                        if not self._is_spike(power_value, last_valid_power):
+                            last_valid_power = power_value
+                            return power_value
+                        else:
+                            _LOGGER.debug(
+                                "Detected spike value %f at %s, using last valid value %f",
+                                power_value, timestamp, last_valid_power if last_valid_power is not None else 0
+                            )
+                            return last_valid_power if last_valid_power is not None else 0
             return None
             
         # If it's state data
@@ -587,7 +626,16 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                 
             if state.last_updated == timestamp:
                 try:
-                    return float(state.state)
+                    power_value = float(state.state)
+                    if not self._is_spike(power_value, last_valid_power):
+                        last_valid_power = power_value
+                        return power_value
+                    else:
+                        _LOGGER.debug(
+                            "Detected spike value %f at %s, using last valid value %f",
+                            power_value, timestamp, last_valid_power if last_valid_power is not None else 0
+                        )
+                        return last_valid_power if last_valid_power is not None else 0
                 except (ValueError, TypeError):
                     return None
         return None
@@ -877,7 +925,7 @@ class LADWPBaseSensor(SensorEntity):
             name=name,
             manufacturer="LADWP",
             model="Energy Cost Calculator",
-            sw_version="0.7.2",
+            sw_version="0.7.3",
             entry_type=DeviceEntryType.SERVICE,
         )
 
