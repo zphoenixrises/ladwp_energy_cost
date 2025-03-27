@@ -128,7 +128,7 @@ async def async_setup_entry(
     except Exception as e:
         _LOGGER.error("Error setting up coordinator: %s", str(e))
         # Continue with setup even if historical data loading fails
-    
+
     # Initial data fetch
     await coordinator.async_config_entry_first_refresh()
 
@@ -289,6 +289,13 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         
         # Track when we need to reset counters
         self._unsub_tracking = None
+        
+        # Initialize spike detection
+        self._power_history = {}  # Store last 10 power values for each entity
+        self._power_history_size = 10
+        self._spike_threshold = 5000  # Lower threshold for spike detection
+        self._max_change_ratio = 5  # Maximum allowed change ratio (5x increase/decrease)
+        self._min_valid_power = 0.1  # Minimum valid power value (100W)
 
     async def async_setup(self) -> None:
         """Set up the coordinator and load historical data."""
@@ -542,28 +549,61 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
         # Sort timestamps
         return sorted(list(timestamps))
         
-    def _is_spike(self, power_value: float, last_valid_power: Optional[float] = None) -> bool:
-        """Detect if a power value is a spike.
+    def _is_spike(self, power_value: float, entity_id: str) -> bool:
+        """Detect if a power value is a spike using multiple methods.
         
         Args:
             power_value: The power value to check
-            last_valid_power: The last valid power value for additional context
+            entity_id: The entity ID for tracking history
             
         Returns:
             bool: True if the value is considered a spike
         """
-        # Basic threshold check for extreme values
-        if abs(power_value) > 10000:
+        # Initialize history for this entity if not exists
+        if entity_id not in self._power_history:
+            self._power_history[entity_id] = []
+            
+        history = self._power_history[entity_id]
+        
+        # Method 1: Basic threshold check
+        if abs(power_value) > self._spike_threshold:
+            _LOGGER.debug(
+                "Spike detected by threshold: %f > %f for %s",
+                abs(power_value), self._spike_threshold, entity_id
+            )
             return True
             
-        # If we have a last valid power value, check for sudden large changes
-        if last_valid_power is not None:
-            # Consider it a spike if the value changes by more than 90%
-            if abs(power_value) > 0 and abs(last_valid_power) > 0:
-                change_ratio = abs(power_value / last_valid_power)
-                if change_ratio > 10 or change_ratio < 0.1:  # 90% increase or decrease
+        # Method 2: Statistical analysis (if we have enough history)
+        if len(history) >= 3:
+            # Calculate mean and standard deviation
+            mean = sum(history) / len(history)
+            std_dev = (sum((x - mean) ** 2 for x in history) / len(history)) ** 0.5
+            
+            # If value is more than 3 standard deviations from mean
+            if abs(power_value - mean) > 3 * std_dev and std_dev > 0:
+                _LOGGER.debug(
+                    "Spike detected by statistical analysis: %f is %f std devs from mean %f for %s",
+                    power_value, abs(power_value - mean) / std_dev, mean, entity_id
+                )
+                return True
+                
+        # Method 3: Sudden change detection
+        if history:
+            last_value = history[-1]
+            if abs(last_value) > self._min_valid_power and abs(power_value) > self._min_valid_power:
+                change_ratio = abs(power_value / last_value)
+                if change_ratio > self._max_change_ratio or change_ratio < 1/self._max_change_ratio:
+                    _LOGGER.debug(
+                        "Spike detected by change ratio: %f (ratio: %f) for %s",
+                        power_value, change_ratio, entity_id
+                    )
                     return True
                     
+        # Update history
+        history.append(power_value)
+        if len(history) > self._power_history_size:
+            history.pop(0)
+            
         return False
         
     def _get_power_at_timestamp(self, history: Optional[List[dict]], timestamp: datetime) -> Optional[float]:
@@ -608,13 +648,15 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
                             pass
                             
                     if power_value is not None:
-                        if not self._is_spike(power_value, last_valid_power):
+                        # Get entity ID from history
+                        entity_id = entry.get("entity_id", "unknown")
+                        if not self._is_spike(power_value, entity_id):
                             last_valid_power = power_value
                             return power_value
                         else:
                             _LOGGER.debug(
-                                "Detected spike value %f at %s, using last valid value %f",
-                                power_value, timestamp, last_valid_power if last_valid_power is not None else 0
+                                "Detected spike value %f at %s for %s, using last valid value %f",
+                                power_value, timestamp, entity_id, last_valid_power if last_valid_power is not None else 0
                             )
                             return last_valid_power if last_valid_power is not None else 0
             return None
@@ -627,13 +669,14 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
             if state.last_updated == timestamp:
                 try:
                     power_value = float(state.state)
-                    if not self._is_spike(power_value, last_valid_power):
+                    entity_id = state.entity_id if hasattr(state, "entity_id") else "unknown"
+                    if not self._is_spike(power_value, entity_id):
                         last_valid_power = power_value
                         return power_value
                     else:
                         _LOGGER.debug(
-                            "Detected spike value %f at %s, using last valid value %f",
-                            power_value, timestamp, last_valid_power if last_valid_power is not None else 0
+                            "Detected spike value %f at %s for %s, using last valid value %f",
+                            power_value, timestamp, entity_id, last_valid_power if last_valid_power is not None else 0
                         )
                         return last_valid_power if last_valid_power is not None else 0
                 except (ValueError, TypeError):
@@ -790,72 +833,72 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update the energy data."""
         try:
-            now = dt_util.now()
-            
-            # Check if we need to reset counters
-            if now >= self._get_next_reset_time():
+        now = dt_util.now()
+        
+        # Check if we need to reset counters
+        if now >= self._get_next_reset_time():
                 _LOGGER.info("Resetting energy data for new billing cycle")
-                self.data = self._init_energy_data()
-                self.last_reset = self._get_billing_cycle_start()
-                
-            # Get current state of entities
-            grid_power = self._get_entity_state(self.grid_entity_id)
-            solar_power = self._get_entity_state(self.solar_entity_id) if self.solar_entity_id else None
-            load_power = self._get_entity_state(self.load_entity_id) if self.load_entity_id else None
+            self.data = self._init_energy_data()
+            self.last_reset = self._get_billing_cycle_start()
             
-            if grid_power is None:
+        # Get current state of entities
+        grid_power = self._get_entity_state(self.grid_entity_id)
+        solar_power = self._get_entity_state(self.solar_entity_id) if self.solar_entity_id else None
+        load_power = self._get_entity_state(self.load_entity_id) if self.load_entity_id else None
+        
+        if grid_power is None:
                 _LOGGER.error("Cannot get grid power state for entity: %s", self.grid_entity_id)
-                return self.data
+            return self.data
             
             _LOGGER.debug(
                 "Entity states - grid: %s, solar: %s, load: %s", 
                 grid_power, solar_power, load_power
             )
-                
-            # Determine current time period
-            current_period = self._get_time_period(now)
-            current_rate = self._get_rate(now, current_period)
+            
+        # Determine current time period
+        current_period = self._get_time_period(now)
+        current_rate = self._get_rate(now, current_period)
             
             _LOGGER.debug("Current period: %s, rate: %s", current_period, current_rate)
+        
+        # Calculate energy for this update interval (kWh)
+        grid_energy = grid_power * WATTS_TO_KWH_PER_MINUTE
+        
+        # Distribute grid energy to appropriate period
+        if grid_energy > 0:  # Delivered from grid (consumption)
+            self.data[f"{current_period}_kwh_delivered"] += grid_energy
+            self.data[ATTR_TOTAL_KWH_DELIVERED] += grid_energy
+        else:  # Received by grid (excess solar)
+            received_energy = abs(grid_energy)
+            self.data[f"{current_period}_kwh_received"] += received_energy
+            self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
+        
+        # Process solar data if available
+        if solar_power is not None:
+            solar_energy = solar_power * WATTS_TO_KWH_PER_MINUTE
             
-            # Calculate energy for this update interval (kWh)
-            grid_energy = grid_power * WATTS_TO_KWH_PER_MINUTE
+            # Add to period solar generation
+            self.data[f"{current_period}_kwh_generated"] += solar_energy
+            self.data[ATTR_TOTAL_KWH_GENERATED] += solar_energy
             
-            # Distribute grid energy to appropriate period
-            if grid_energy > 0:  # Delivered from grid (consumption)
-                self.data[f"{current_period}_kwh_delivered"] += grid_energy
-                self.data[ATTR_TOTAL_KWH_DELIVERED] += grid_energy
-            else:  # Received by grid (excess solar)
-                received_energy = abs(grid_energy)
-                self.data[f"{current_period}_kwh_received"] += received_energy
-                self.data[ATTR_TOTAL_KWH_RECEIVED] += received_energy
-                
-            # Process solar data if available
-            if solar_power is not None:
-                solar_energy = solar_power * WATTS_TO_KWH_PER_MINUTE
-                
-                # Add to period solar generation
-                self.data[f"{current_period}_kwh_generated"] += solar_energy
-                self.data[ATTR_TOTAL_KWH_GENERATED] += solar_energy
-                
-                # Calculate savings from solar (at current period rate)
-                self.data[ATTR_SOLAR_COST_SAVINGS] += solar_energy * current_rate
-                
-            # Process load data if available
-            if load_power is not None:
-                load_energy = load_power * WATTS_TO_KWH_PER_MINUTE
-                
-                # Add to period consumption
-                self.data[f"{current_period}_kwh_consumed"] += load_energy
-                self.data[ATTR_TOTAL_KWH_CONSUMED] += load_energy
-                
-                # Calculate load cost (at current period rate)
-                self.data[ATTR_LOAD_COST] += load_energy * current_rate
+            # Calculate savings from solar (at current period rate)
+            self.data[ATTR_SOLAR_COST_SAVINGS] += solar_energy * current_rate
+            
+        # Process load data if available
+        if load_power is not None:
+            load_energy = load_power * WATTS_TO_KWH_PER_MINUTE
+            
+            # Add to period consumption
+            self.data[f"{current_period}_kwh_consumed"] += load_energy
+            self.data[ATTR_TOTAL_KWH_CONSUMED] += load_energy
+            
+            # Calculate load cost (at current period rate)
+            self.data[ATTR_LOAD_COST] += load_energy * current_rate
             
             # Update net values and costs
             self._update_net_values_and_costs(now)
-                
-            return self.data
+            
+        return self.data
         except Exception as e:
             _LOGGER.exception("Error updating LADWP energy data: %s", str(e))
             # Return existing data on error to avoid breaking the sensor
@@ -896,7 +939,7 @@ class LADWPEnergyDataCoordinator(DataUpdateCoordinator):
 # Base sensor class with shared properties
 class LADWPBaseSensor(SensorEntity):
     """Base class for LADWP Energy Cost sensors."""
-    
+
     _attr_should_poll = False
     
     def __init__(
@@ -925,7 +968,7 @@ class LADWPBaseSensor(SensorEntity):
             name=name,
             manufacturer="LADWP",
             model="Energy Cost Calculator",
-            sw_version="0.7.3",
+            sw_version="0.7.4",
             entry_type=DeviceEntryType.SERVICE,
         )
 
